@@ -170,6 +170,30 @@ func TestCustomInputStreams(t *testing.T) {
 		{`{"input":5}`, ""},
 		{`{"other":"x"}`, ""},
 		{`not json`, ""},
+		// what a model offered the tool as a function writes that JSON
+		// can't read, read as it meant it (Codex in code mode saw exec stop
+		// at each of these while the model went on): an escape JSON hasn't
+		{`{"input":"rg -n -o -I '\d+' notes.txt"}`, `rg -n -o -I '\d+' notes.txt`},
+		{`{"input":"Get-ChildItem -Filter \"*.md\" C:\Users\a\Desktop"}`, `Get-ChildItem -Filter "*.md" C:\Users\a\Desktop`},
+		{`{"input":"\x41 \u12 \uZZZZ"}`, `\x41 \u12 \uZZZZ`},
+		{`{"input":"a\\\d \ud83d\ude00\q"}`, `a\\d 😀\q`},
+		// a raw control character
+		{"{\"input\":\"tab\there\nnew line\"}", "tab\there\nnew line"},
+		// a quote it didn't escape, where the arguments don't go on from it
+		{`{"input":"q({search_query:"go generics"})"}`, `q({search_query:"go generics"})`},
+		{`{"input":"print("a", "b")"}`, `print("a", "b")`},
+		{`{"input":"x = {"k": "v"}; y"}`, `x = {"k": "v"}; y`},
+		{`{"input":"say "hi"}`, `say "hi`},
+		{`"lone "quoted" \d"`, `lone "quoted" \d`},
+		// a quote the arguments go on from still ends it
+		{`{"input":"a", "path":"b.go"}`, "a"},
+		{`{"input":"a" , "p\"q" : 1}`, "a"},
+		{"{\"input\":\"a\" }\n", "a"},
+		// arguments cut off: an escape, a character, a pair's half at the end
+		{`{"input":"cut \`, `cut \`},
+		{`{"input":"cut \u00`, `cut \u00`},
+		{`{"input":"cut \ud83d`, "cut \ufffd"},
+		{"{\"input\":\"cut \xe2\x82", "cut \ufffd\ufffd"},
 	} {
 		for _, size := range []int{1, 2, 3, 5, 7, len(c.args)} {
 			var s customStream
@@ -177,6 +201,7 @@ func TestCustomInputStreams(t *testing.T) {
 			for i := 0; i < len(c.args); i += size {
 				got.WriteString(s.feed(c.args[i:min(i+size, len(c.args))]))
 			}
+			got.WriteString(s.finish())
 			if got.String() != c.want {
 				t.Errorf("%s in pieces of %d: %q, want %q", c.args, size, got.String(), c.want)
 			}
@@ -184,6 +209,30 @@ func TestCustomInputStreams(t *testing.T) {
 				t.Errorf("%s: customInput %q", c.args, customInput(c.args))
 			}
 		}
+	}
+}
+
+// What streams before the arguments end is given as it comes: a quote
+// waits only on what follows it, and the text before it isn't held back.
+func TestCustomInputStreamsAhead(t *testing.T) {
+	var s customStream
+	if got := s.feed(`{"input":"rg '\d`); got != `rg '\d` {
+		t.Fatalf("before the quote's end is known: %q", got)
+	}
+	if got := s.feed(`+' "x`); got != `+' "x` {
+		t.Fatalf("a quote followed by more input: %q", got)
+	}
+	if got := s.feed(`"`); got != "" {
+		t.Fatalf("a quote at the pieces' end: %q", got)
+	}
+	if got := s.feed(`}`); got != "" {
+		t.Fatalf("a quote then the object's end: %q", got)
+	}
+	if got := s.finish(); got != "" {
+		t.Fatalf("the end: %q", got)
+	}
+	if got := customInput(`{"input":"rg '\d+' "x"}`); got != `rg '\d+' "x` {
+		t.Fatalf("customInput %q", got)
 	}
 }
 
@@ -213,5 +262,64 @@ func TestResponsesCallArgsStream(t *testing.T) {
 	d.decode(`{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"cmd\":\"a}\\\"]{\",\"n\":[1,{}],\"more\":true}"}}`, emit)
 	if all := strings.Join(got, ""); all != `{"cmd":"a}\"]{","n":[1,{}],"more":true}` {
 		t.Fatalf("arguments %s", all)
+	}
+}
+
+// A custom tool's input a model wrote that JSON can't read reaches Codex
+// as it streams, and the deltas add up to the finished item's input: the
+// translated exec in code mode stopped at a regex's \d, a quote it hadn't
+// escaped, and Codex ran the whole arguments as its input. What waited on
+// the arguments' end (a backslash they end with) is given before the
+// input's done.
+func TestCustomInputThatIsntJSONStreams(t *testing.T) {
+	for _, c := range []struct{ args, want string }{
+		{"{\"input\":\"rg -n '\\d+' \"a b\"\tc\"}", "rg -n '\\d+' \"a b\"\tc"},
+		{`{"input":"dir C:\Users\a \`, `dir C:\Users\a \`},
+	} {
+		fresh(t)
+		vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			q := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+			lines := []string{`data: {"type":"response.created","response":{"id":"r1","model":"m"}}`,
+				`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"apply_patch","arguments":""}}`}
+			for i := 0; i < len(c.args); i += 3 {
+				lines = append(lines, `data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":`+q(c.args[i:min(i+3, len(c.args))])+`}`)
+			}
+			call := `{"type":"function_call","id":"fc_1","call_id":"call_1","name":"apply_patch","arguments":` + q(c.args) + `,"status":"completed"}`
+			lines = append(lines, `data: {"type":"response.output_item.done","output_index":0,"item":`+call+`}`,
+				`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[`+call+`],"usage":{"input_tokens":5,"output_tokens":5}}}`)
+			io.WriteString(w, sse(lines...))
+		}))
+		t.Cleanup(vendor.Close)
+		if err := provider.Save(provider.Provider{ID: "rel", Name: "Rel", Key: "k", Responses: vendor.URL + "/v1", Models: []string{"m"}}); err != nil {
+			t.Fatal(err)
+		}
+		body := `{"model":"rel/m","stream":true,"input":[{"role":"user","content":"search"}],
+			"tools":[{"type":"custom","name":"apply_patch","description":"Edits files.","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
+			 {"type":"web_search"}],"tool_choice":"auto"}`
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+		if rec.Code != 200 {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+		var deltas strings.Builder
+		var done, item any
+		for _, e := range events(rec.Body.String()) {
+			switch e["type"] {
+			case "response.custom_tool_call_input.delta":
+				d, _ := e["delta"].(string)
+				deltas.WriteString(d)
+			case "response.custom_tool_call_input.done":
+				done = e["input"]
+			case "response.output_item.done":
+				if it, _ := e["item"].(map[string]any); it["type"] == "custom_tool_call" {
+					item = it["input"]
+				}
+			}
+		}
+		if deltas.String() != c.want || done != c.want || item != c.want {
+			t.Errorf("%s: deltas %q, done %q, item %q, want %q", c.args, deltas.String(), done, item, c.want)
+		}
 	}
 }

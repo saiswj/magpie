@@ -137,6 +137,12 @@ func customInput(args string) string {
 	if decodeJSON([]byte(args), &str) == nil {
 		return str
 	}
+	// arguments JSON can't read: their input as the stream reads it, so
+	// the deltas a client was given add up to it
+	var c customStream
+	if text := c.feed(args) + c.finish(); c.in {
+		return text
+	}
 	return args
 }
 
@@ -2333,7 +2339,11 @@ func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 		item = callTo(map[string]any{"id": e.itemID, "type": "function_call", "status": "completed", "call_id": p.ID, "arguments": args}, p.Name, e.named)
 		switch q := e.named[p.Name]; {
 		case q.Custom:
-			// as OpenAI ends a custom tool's input deltas
+			// what of the input waited on the arguments' end, then the
+			// end of its deltas, as OpenAI ends them
+			if in := e.input.finish(); in != "" {
+				e.send("response.custom_tool_call_input.delta", map[string]any{"item_id": e.itemID, "output_index": e.item, "delta": in})
+			}
 			input, _ := item.(map[string]any)["input"].(string)
 			e.send("response.custom_tool_call_input.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "input": input})
 		case !q.Search:
